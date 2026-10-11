@@ -1,0 +1,24 @@
+# macOS / editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Python and Jupyter generated files
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Local environment files
+.env
+.env.*
+
+# Model weights and checkpoints (regenerate with deep_models/polar_models.py)
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# The dataset CSVs, result CSVs and the two zip archives are part of the
+# submission and are tracked on purpose.
