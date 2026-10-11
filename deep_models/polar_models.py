@@ -65,6 +65,16 @@ def unsegment(text: str) -> str:
     return re.sub(rf"(?<=[{_MY}])\s+(?=[{_MY}])", "", str(text)).strip()
 
 
+# Input units for the Bi-LSTM / Transformer (--unit). "syllable" is the default used for the
+# main results; "word" and "char" exist for the text-unit comparison in error_analysis.py.
+UNITS = {
+    "syllable": syllables,
+    "word": lambda t: str(t).lower().split(),               # the contributor's own whitespace segmentation
+    "char": lambda t: list(re.sub(r"\s+", " ", unsegment(t).lower())),
+}
+LEN_FACTOR = {"syllable": 1, "word": 1, "char": 3}  # a syllable is about 3 characters
+
+
 def load(task: str, split_dir: Path):
     d = {s: pd.read_csv(split_dir / f"{task}_{s}.csv", encoding="utf-8-sig") for s in ["train", "val", "test"]}
     y = {s: d[s][TASKS[task]].values.astype("float32") for s in d}
@@ -140,14 +150,14 @@ XLMR_NAME = "FacebookAI/xlm-roberta-base"
 
 
 # ---------------------------------------------------------------- training
-def encode(model_name, x, max_len):
+def encode(model_name, x, max_len, unit="syllable"):
     """-> {split: list of token-id lists}, vocab size, pad id."""
     if model_name == "xlmr":
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(XLMR_NAME)
         ids = {s: tok([unsegment(t) for t in x[s]], truncation=True, max_length=max_len)["input_ids"] for s in x}
         return ids, tok.vocab_size, tok.pad_token_id
-    toks = {s: [syllables(t)[:max_len] for t in x[s]] for s in x}
+    toks = {s: [UNITS[unit](t)[:max_len] for t in x[s]] for s in x}
     freq = Counter(t for sent in toks["train"] for t in sent)
     vocab = {t: i + 2 for i, t in enumerate(sorted(t for t, c in freq.items() if c >= 2))}  # 0 pad, 1 unk
     ids = {s: [[vocab.get(t, 1) for t in sent] or [1] for sent in toks[s]] for s in toks}
@@ -174,12 +184,14 @@ def predict(model, ids, y, bs, pad):
     return (np.concatenate(out) >= 0.5).astype(int)
 
 
-def run(task, model_name, seed, split_dir):
-    cfg = CONFIG[model_name]
+def run(task, model_name, seed, split_dir, unit="syllable", pred_dir=None):
+    cfg = dict(CONFIG[model_name])
+    if model_name != "xlmr":
+        cfg["max_len"] *= LEN_FACTOR[unit]
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     x, y = load(task, split_dir)
-    ids, vocab, pad = encode(model_name, x, cfg["max_len"])
+    ids, vocab, pad = encode(model_name, x, cfg["max_len"], unit)
     n_out = y["train"].shape[1]
 
     if model_name == "bilstm":
@@ -214,11 +226,20 @@ def run(task, model_name, seed, split_dir):
               f"val_f1 {val:.4f}  ({time.time() - t:.0f}s)", flush=True)
         if val > best["val"]:
             pred = predict(model, ids["test"], y["test"], cfg["bs"], pad)
-            best = {"val": val, "epoch": epoch, "test": macro_f1(y["test"], pred),
+            best = {"val": val, "epoch": epoch, "test": macro_f1(y["test"], pred), "pred": pred,
                     "per_label": dict(zip(TASKS[task], f1_score(y["test"], pred, average=None, zero_division=0).round(4).tolist()))
                     if n_out > 1 else {}}
         elif epoch - best["epoch"] >= cfg["patience"]:
             break
+    if pred_dir:  # test predictions at the selected epoch, for error analysis
+        test = pd.read_csv(split_dir / f"{task}_test.csv", encoding="utf-8-sig")
+        out = pd.DataFrame(best["pred"], columns=[f"pred_{c}" for c in TASKS[task]])
+        out.insert(0, "id", test["id"])
+        Path(pred_dir).mkdir(parents=True, exist_ok=True)
+        tag = model_name if unit == "syllable" else f"{model_name}_{unit}"
+        out.to_csv(Path(pred_dir) / f"{task}_{tag}_seed{seed}.csv", index=False)
+    if unit != "syllable":
+        model_name = f"{model_name}_{unit}"
     return {"task": task, "model": model_name, "seed": seed, "best_epoch": best["epoch"],
             "val_macro_f1": round(best["val"], 4), "test_macro_f1": round(best["test"], 4),
             "per_label_test_f1": json.dumps(best["per_label"])}
@@ -231,6 +252,8 @@ if __name__ == "__main__":
     ap.add_argument("--seeds", type=int, nargs="+", default=[42])
     ap.add_argument("--splits", default=str(HERE.parent / "baseline_traditional_ml" / "splits"))
     ap.add_argument("--out", default=str(HERE / "results" / "neural_results.csv"))
+    ap.add_argument("--unit", default="syllable", choices=list(UNITS), help="input unit (bilstm / transformer only)")
+    ap.add_argument("--save_preds", default=None, help="directory for test predictions")
     a = ap.parse_args()
 
     out = Path(a.out)
@@ -238,6 +261,6 @@ if __name__ == "__main__":
     print(f"device: {DEVICE}")
     for task in (TASKS if a.task == "all" else [a.task]):
         for seed in a.seeds:
-            row = run(task, a.model, seed, Path(a.splits))
+            row = run(task, a.model, seed, Path(a.splits), a.unit, a.save_preds)
             print(f"=> {row}", flush=True)
             pd.DataFrame([row]).to_csv(out, mode="a", header=not out.exists(), index=False)

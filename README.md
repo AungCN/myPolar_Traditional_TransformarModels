@@ -16,7 +16,8 @@ Group 3 submission for Assignment 7 (AI Engineering Fundamental, Batch 2). We me
 | [final/final_dataset.csv](final/final_dataset.csv) | Merged dataset with all labels and `key_phrase` |
 | [final/task1_polarization.csv](final/task1_polarization.csv), [task2_type.csv](final/task2_type.csv), [task3_manifestation.csv](final/task3_manifestation.csv) | Stage 2: de-duplicated model-ready files (`id`, `text`, labels) |
 | [baseline_traditional_ml/](baseline_traditional_ml/) | TF-IDF + Logistic Regression / Linear SVM notebook and the train / val / test `splits/` used by every model |
-| [deep_models/](deep_models/) | Bi-LSTM, Transformer and XLM-R training code, result files, logs, and the comparison notebook |
+| [deep_models/](deep_models/) | Bi-LSTM, Transformer and XLM-R training code, result files, logs, the comparison notebook, and the error analysis |
+| [myPolar_Assignment7_G3.pptx](myPolar_Assignment7_G3.pptx) | Presentation slides with speaker notes |
 | `myPolar_dataset.zip`, `baseline_traditional_ml.zip` | Zipped copies of `final/` and `baseline_traditional_ml/` |
 
 ## Data
@@ -84,7 +85,54 @@ Per-label scores, validation scores and selected epochs are in [deep_models/resu
 5. **Explicit labels are easier than implicit ones.** `political` and `vilification` reach 0.65 to 0.69 for the best models, while `stereotype`, `lack_of_empathy` and `invalidation` stay below 0.47 for every model. XLM-R is the best model on `gender/sexual` (0.64 vs 0.60) and `vilification` (0.67 vs 0.65).
 6. **Small differences are within noise.** The test sets have about 1,000 sentences, and XLM-R's validation and test scores on Task 1 differ by 0.04 (0.811 vs 0.770), so gaps of 0.01 to 0.02 between models should not be read as real.
 
-Caveats: XLM-R was run once per task with no hyperparameter search and with frozen token embeddings because of memory limits, so its numbers are a lower bound on what fine-tuning can do. The unseen-contributor XLM-R run used a 5-epoch schedule instead of 4.
+Caveats: XLM-R was run once per task with no hyperparameter search and with frozen token embeddings because of memory limits, so its numbers are a lower bound on what fine-tuning can do. The unseen-contributor XLM-R run used a 5-epoch schedule instead of 4. Training on MPS is not exactly repeatable: re-running the Bi-LSTM with seed 42 for the error analysis gave 0.758 / 0.534 / 0.477 against 0.759 / 0.519 / 0.468 in the first run.
+
+## Error analysis
+
+Produced by [deep_models/error_analysis.py](deep_models/error_analysis.py); every table is saved in [deep_models/results/error_analysis/](deep_models/results/error_analysis/). All numbers are on the test sets, single runs (seed 42).
+
+### Word, syllable or character?
+
+Test macro F1 with the same classifier and only the input unit changed.
+
+| Input unit | TF-IDF T1 | TF-IDF T2 | TF-IDF T3 | Bi-LSTM T1 | Bi-LSTM T2 | Bi-LSTM T3 |
+|---|---|---|---|---|---|---|
+| Word (whitespace tokens) | 0.751 | 0.410 | 0.438 | 0.728 | 0.389 | 0.425 |
+| Syllable | **0.785** | 0.549 | 0.475 | **0.758** | **0.534** | **0.477** |
+| Character | 0.782 | **0.572** | **0.509** | 0.729 | 0.470 | 0.436 |
+
+- **Words are the worst unit for both models,** by 0.03 on Task 1 and by up to 0.16 on Task 2. Contributors segmented their text differently, so the same word appears as different whitespace tokens: 34% of the word tokens in the test set are unknown to a vocabulary built from the training set, against 0.8% of syllables and 0% of characters.
+- **TF-IDF works best with character n-grams, the Bi-LSTM with syllables.** Character n-grams of length 2 to 5 already cover syllables and short words. For the Bi-LSTM, characters make the sequences about three times longer and it does worse.
+- Removing the spaces before taking character n-grams did not help (0.782 on Task 1, 0.545 on Task 2, 0.487 on Task 3).
+
+### Task 1: where the errors are
+
+The TF-IDF baseline makes 225 errors on 1,071 test sentences (108 false positives, 117 false negatives); the Bi-LSTM makes 259 (137 and 122).
+
+| Group | n | TF-IDF accuracy | Bi-LSTM accuracy |
+|---|---|---|---|
+| 1–15 syllables | 148 | 0.736 | 0.682 |
+| 16–30 syllables | 345 | 0.757 | 0.762 |
+| 31–60 syllables | 390 | 0.821 | 0.782 |
+| 61+ syllables | 188 | 0.830 | 0.761 |
+| Word-segmented text | 504 | 0.829 | 0.752 |
+| Phrase-segmented text | 434 | 0.772 | 0.779 |
+| Unsegmented text | 133 | 0.699 | 0.714 |
+
+- **Short sentences are the hardest** for both models. Up to 30 syllables, about one in three non-polarized sentences is flagged as polarized.
+- **TF-IDF depends on segmentation; the Bi-LSTM does not.** On unsegmented text TF-IDF misses 55% of the polarized sentences. The Bi-LSTM reads syllables and ignores the spacing, and its accuracy stays between 0.71 and 0.78. Segmentation style goes together with contributor and source, so this is not a pure effect of spacing.
+- **Accuracy per contributor ranges from 0.50 to 0.98.** It is highest where one class dominates (0.98 for a contributor with no polarized sentences) and lowest for `mya_hanzawhtet` (0.50) and `mya_myothet` (0.52), where the baseline misses 69% and 75% of the polarized sentences.
+- **Polarized sentences without a type or manifestation label are found only about half the time** (recall 0.48 to 0.55, against 0.74 to 0.92 for the labelled ones). The baseline finds `religious` polarization most easily (recall 0.89) and `other` and `racial/ethnic` least (0.77).
+- **The strongest character n-grams are partly style, not content.** Insults and violent words (ခွေး, သတ်, ဖာ) point to polarized, but the strongest non-polarized features are sentence endings and punctuation of formal news writing (တယ်။, ၏။, brackets). The model partly separates news style from social-media style.
+- **The two models fail on different sentences.** Both are wrong on 136; one of the two is right on another 212. If the right model could always be picked, accuracy would be 0.873, so an ensemble has room to improve.
+- **Some errors look like label noise.** Among the most confident errors ([confident_errors.csv](deep_models/results/error_analysis/confident_errors.csv)) there are sentences with open insults labelled non-polarized and plain news sentences labelled polarized. We read only a sample and did not re-annotate.
+
+### Tasks 2 and 3: per-label errors (TF-IDF baseline)
+
+- **The models over-predict.** Every label has more false positives than false negatives, a result of the balanced class weights. `other` is predicted 263 times for 157 true cases (precision 0.39).
+- **Task 2 misses are mostly silent.** When `political`, `racial/ethnic`, `gender/sexual` or `other` is missed, about half the time no type is predicted at all. Missed `religious` is given `political` instead in 56% of cases, and missed `gender/sexual` is given `other` in 44%.
+- **Task 3 labels are confused with each other.** Missed `dehumanization` is predicted as `vilification` in 64% of cases and missed `lack_of_empathy` in 59%. These labels often occur together and share vocabulary.
+- **Exact match** (all labels of a sentence correct) is 0.57 on Task 2 and 0.47 on Task 3.
 
 ## How to reproduce
 
@@ -106,6 +154,12 @@ for m in bilstm transformer xlmr; do
 done
 
 # 4. Tables and figure: run deep_models/results_comparison.ipynb
+
+# 5. Error analysis: Bi-LSTM with word / syllable / character input, then the tables
+for t in task1 task2 task3; do for u in syllable word char; do
+  python polar_models.py --model bilstm --task $t --unit $u --save_preds results/predictions --out results/unit_ablation_bilstm.csv
+done; done
+python error_analysis.py
 ```
 
 Trained on an Apple M4 (16 GB) with PyTorch MPS. The Bi-LSTM and Transformer take 2–8 minutes per run; XLM-R takes about 20–30 minutes per task.
